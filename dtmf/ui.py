@@ -2,9 +2,16 @@ from __future__ import annotations
 
 from functools import partial
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QEvent, QObject, Qt, Signal
 from PySide6.QtGui import QFocusEvent, QFont, QKeyEvent, QMouseEvent
-from PySide6.QtWidgets import QGridLayout, QLabel, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QApplication,
+    QGridLayout,
+    QLabel,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
 
 from dtmf.audio import DTMF_KEYS, DTMFKey, play_tone, stop_tone
 
@@ -70,10 +77,10 @@ _ERROR_STYLE = (
 
 
 class KeyButton(QPushButton):
-    """A single DTMF key button. Emits signals on press and release."""
+    """A single DTMF key button. Emits key_pressed on left-click; release is
+    handled globally by KeypadWidget's event filter."""
 
     key_pressed = Signal(object)  # emits DTMFKey
-    key_released = Signal()
 
     def __init__(self, dtmf_key: DTMFKey, parent: QWidget | None = None) -> None:
         super().__init__(dtmf_key.label, parent)
@@ -83,7 +90,6 @@ class KeyButton(QPushButton):
         font.setBold(True)
         self.setFont(font)
         self.setMinimumSize(70, 70)
-        # Keyboard focus goes to the KeypadWidget, not individual buttons
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setStyleSheet(_BUTTON_STYLE_IDLE)
 
@@ -92,14 +98,11 @@ class KeyButton(QPushButton):
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
-            self.grabMouse()
             self.key_pressed.emit(self.dtmf_key)
         event.accept()
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.releaseMouse()
-            self.key_released.emit()
+        # Handled by KeypadWidget.eventFilter — accept to suppress Qt default
         event.accept()
 
 
@@ -110,13 +113,18 @@ class KeypadWidget(QWidget):
         super().__init__()
         self._active_button: KeyButton | None = None
         self._active_kbd_label: str | None = None
-        # label → button, for keyboard dispatch
+        self._mouse_pressed: bool = False
         self._buttons: dict[str, KeyButton] = {}
         self._disabled = audio_error is not None
 
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setStyleSheet("background-color: #1e1e1e;")
         self._build_layout(audio_error)
+
+        # Global event filter to catch mouse release anywhere on screen
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
 
     # ------------------------------------------------------------------
     # Layout
@@ -128,7 +136,7 @@ class KeypadWidget(QWidget):
         outer.setSpacing(10)
 
         if audio_error:
-            banner = QLabel(f"\u26a0\ufe0f  Audio unavailable: {audio_error}")
+            banner = QLabel(f"⚠  Audio unavailable: {audio_error}")
             banner.setStyleSheet(_ERROR_STYLE)
             banner.setAlignment(Qt.AlignmentFlag.AlignCenter)
             outer.addWidget(banner)
@@ -139,21 +147,21 @@ class KeypadWidget(QWidget):
         grid.setSpacing(6)
         grid.setContentsMargins(0, 0, 0, 0)
 
-        # Derive unique sorted col/row freqs from DTMF_KEYS
         col_freqs = sorted({k.col_freq for k in DTMF_KEYS})
         row_freqs = sorted({k.row_freq for k in DTMF_KEYS})
 
-        # Column frequency headers (row 0, cols 1–4)
+        # Column frequency headers — "1209 Hz" across the top
         for col_idx, freq in enumerate(col_freqs):
             lbl = QLabel(f"{int(freq)} Hz")
             lbl.setFont(_MONO_FONT)
             lbl.setStyleSheet(_LABEL_STYLE)
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setFixedHeight(22)
             grid.addWidget(lbl, 0, col_idx + 1)
 
-        # Row frequency labels (rows 1–4, col 0)
+        # Row frequency labels — just the number to keep the column narrow
         for row_idx, freq in enumerate(row_freqs):
-            lbl = QLabel(f"{int(freq)} Hz")
+            lbl = QLabel(str(int(freq)))
             lbl.setFont(_MONO_FONT)
             lbl.setStyleSheet(_LABEL_STYLE)
             lbl.setAlignment(
@@ -162,37 +170,61 @@ class KeypadWidget(QWidget):
             lbl.setContentsMargins(0, 0, 6, 0)
             grid.addWidget(lbl, row_idx + 1, 0)
 
-        # Buttons (rows 1–4, cols 1–4)
+        # Buttons
         for key in DTMF_KEYS:
             btn = KeyButton(key)
             if self._disabled:
                 btn.setEnabled(False)
-            btn.key_pressed.connect(partial(self._on_button_pressed, btn))
-            btn.key_released.connect(self._on_button_released)
+            btn.key_pressed.connect(partial(self._activate_from_mouse, btn))
             grid.addWidget(btn, key.row_index + 1, key.col_index + 1)
             self._buttons[key.label] = btn
+
+        # Label column and header row stay compact; button area gets all extra space
+        grid.setColumnStretch(0, 0)
+        grid.setRowStretch(0, 0)
+        for i in range(1, 5):
+            grid.setColumnStretch(i, 1)
+            grid.setRowStretch(i, 1)
 
         outer.addWidget(grid_widget)
 
     # ------------------------------------------------------------------
-    # Activation logic
+    # Activation / deactivation
     # ------------------------------------------------------------------
 
-    def _on_button_pressed(self, button: KeyButton, key: object) -> None:
-        dtmf_key = key  # Signal emits DTMFKey as object
+    def _activate(self, button: KeyButton, dtmf_key: DTMFKey) -> None:
         if self._active_button is not None and self._active_button is not button:
             self._active_button.set_active(False)
         button.set_active(True)
         self._active_button = button
-        if isinstance(dtmf_key, DTMFKey):
-            play_tone(dtmf_key.row_freq, dtmf_key.col_freq)
+        play_tone(dtmf_key.row_freq, dtmf_key.col_freq)
 
-    def _on_button_released(self) -> None:
+    def _deactivate(self) -> None:
         if self._active_button is not None:
             self._active_button.set_active(False)
             self._active_button = None
         self._active_kbd_label = None
         stop_tone()
+
+    def _activate_from_mouse(self, button: KeyButton, key: object) -> None:
+        self._mouse_pressed = True
+        if isinstance(key, DTMFKey):
+            self._activate(button, key)
+
+    # ------------------------------------------------------------------
+    # Global mouse-release event filter
+    # ------------------------------------------------------------------
+
+    def eventFilter(self, _watched: QObject, event: QEvent) -> bool:
+        if (
+            self._mouse_pressed
+            and event.type() == QEvent.Type.MouseButtonRelease
+            and isinstance(event, QMouseEvent)
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            self._mouse_pressed = False
+            self._deactivate()
+        return False  # never consume the event
 
     # ------------------------------------------------------------------
     # Keyboard events
@@ -205,24 +237,23 @@ class KeypadWidget(QWidget):
         if label is None:
             super().keyPressEvent(event)
             return
-        # Ignore if this key is already the active keyboard key
         if label == self._active_kbd_label:
             return
         self._active_kbd_label = label
+        self._mouse_pressed = False
         btn = self._buttons.get(label)
         if btn is not None and btn.isEnabled():
-            self._on_button_pressed(btn, btn.dtmf_key)
+            self._activate(btn, btn.dtmf_key)
 
     def keyReleaseEvent(self, event: QKeyEvent) -> None:
         if event.isAutoRepeat():
             return
         label = _KEY_MAP.get(event.key())
         if label is not None and label == self._active_kbd_label:
-            self._on_button_released()
+            self._deactivate()
         else:
             super().keyReleaseEvent(event)
 
     def focusOutEvent(self, event: QFocusEvent) -> None:
-        # Stop tone if window loses focus while a key is held
-        self._on_button_released()
+        self._deactivate()
         super().focusOutEvent(event)

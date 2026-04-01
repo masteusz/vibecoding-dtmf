@@ -37,4 +37,6 @@ _Review after all build phases PASS. Categorize each item:_
 
 | Item | Decision | Notes |
 |------|---------|-------|
-| | | |
+| Waveform / oscilloscope display | v2 | Functional app ships without it; adds pyqtgraph + painter complexity |
+| Sequence / dialing mode | v2 | Fun extension; ship core first |
+| Microphone decoder mode | Won't do | Different use case; separate project |
