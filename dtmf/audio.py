@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 import threading
 from dataclasses import dataclass
 
@@ -100,6 +101,16 @@ class _DtmfAudioEngine:
                 return
             self._stopping = True
             self._fade_out_pos = 0
+        # Close the stream from a background thread after the fade (8 ms) plus
+        # enough time for the hardware output buffer to drain (50 ms total).
+        # This avoids a click from CallbackStop cutting the stream mid-buffer.
+        threading.Thread(target=self._close_after_fade, daemon=True).start()
+
+    def _close_after_fade(self) -> None:
+        time.sleep(0.05)
+        with self._lock:
+            if self._stopping and self._stream is not None:
+                self._stop_stream_locked()
 
     # ------------------------------------------------------------------
     # Internal
@@ -156,13 +167,15 @@ class _DtmfAudioEngine:
             samples[:fade_end] *= ramp
             self._fade_in_pos = fade_in_pos + fade_end
 
-        # Fade-out
+        # Fade-out — no CallbackStop; stream stays open and outputs zeros until
+        # _close_after_fade() closes it, ensuring the hardware buffer drains.
         if self._stopping:
             pos = self._fade_out_pos
             remaining = FADE_SAMPLES - pos
             if remaining <= 0:
-                outdata[:] = 0
-                raise sd.CallbackStop()
+                # Fade complete — output silence until the stream is closed
+                outdata.fill(0.0)
+                return
             fade_frames = min(frames, remaining)
             ramp = np.linspace(
                 1.0 - pos / FADE_SAMPLES,
@@ -173,9 +186,6 @@ class _DtmfAudioEngine:
             if fade_frames < frames:
                 samples[fade_frames:] = 0.0
             self._fade_out_pos = pos + fade_frames
-            if self._fade_out_pos >= FADE_SAMPLES:
-                outdata[:] = samples.reshape(-1, 1).astype(np.float32)
-                raise sd.CallbackStop()
 
         outdata[:] = samples.reshape(-1, 1).astype(np.float32)
 
