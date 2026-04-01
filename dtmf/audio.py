@@ -211,3 +211,8 @@ def play_tone(row_freq: float, col_freq: float) -> None:
 def stop_tone() -> None:
     """Stop the currently playing tone."""
     _get_engine().stop_tone()
+
+
+def init() -> None:
+    """Eagerly initialize the audio engine. Raises AudioInitError if no device is available."""
+    _get_engine()
